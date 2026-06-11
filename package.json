@@ -1,6 +1,6 @@
 {
   "name": "claude-switch",
-  "version": "0.2.0",
+  "version": "0.3.1",
   "description": "Terminal-first multi-account switcher for Claude Code. codex-auth style experience: flexible switch by number/name/alias, interactive picker, full isolation launches, aliases, export/import. Works great on Windows.",
   "bin": {
     "claude-switch": "dist/cli.js",

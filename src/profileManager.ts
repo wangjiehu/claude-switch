@@ -41,6 +41,7 @@ import {
   formatRelativeTime,
   AccountType,
   PlanType,
+  REGISTRY_FILE,
 } from './registry';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -470,9 +471,7 @@ export async function switchProfile(name: string) {
       console.log(chalk.gray(`Active config dir: ${activeDir}`));
     }
 
-    // 3. Update metadata & registry
-    meta.lastUsed = new Date().toISOString();
-    await fs.writeJson(metaPath, meta, { spaces: 2 });
+    // 3. Update registry (single source of truth for lastUsed)
     await touchAccount(sanitizeProfileName(name));
     await setCurrentProfile(sanitizeProfileName(name));
 
@@ -503,11 +502,14 @@ export async function printEnv(shell?: string) {
 
   const key = await readApiKeyFromProfile(current);
   if (key) {
-    // Output depends on requested shell
-    if (shell === 'powershell' || (process.platform === 'win32' && !shell)) {
+    // Delegate shell detection to formatApiKeyExport — single source of truth
+    if (shell === 'powershell') {
       console.log(`$env:ANTHROPIC_API_KEY="${key}"`);
-    } else {
+    } else if (shell === 'bash') {
       console.log(`export ANTHROPIC_API_KEY="${key}"`);
+    } else {
+      // Auto-detect based on platform
+      console.log(formatApiKeyExport(key));
     }
     return;
   }
@@ -654,7 +656,7 @@ export async function runProfile(name: string, extraArgs: string[] = []) {
     const env = { ...process.env, ANTHROPIC_API_KEY: key };
     logInfo(`Launching claude with API key from profile "${name}"...`);
     const claudeBin = resolveClaudeBin();
-    const child = require('child_process').spawn(claudeBin, extraArgs, {
+    const child = spawn(claudeBin, extraArgs, {
       stdio: 'inherit',
       env,
       shell: true,
@@ -1052,7 +1054,7 @@ export async function importProfiles(inputDir: string, force = false) {
           localReg.accounts.push(acc);
         }
       }
-      await fs.writeJson(require('../src/registry').REGISTRY_FILE || path.join(SWITCH_DIR, 'registry.json'), localReg, { spaces: 2 });
+      await fs.writeJson(REGISTRY_FILE, localReg, { spaces: 2 });
     }
 
     spinner.succeed(`Imported ${imported} profiles.`);
