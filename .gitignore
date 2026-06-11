@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.DS_Store
+*.log
+.env
+.claude-switch/
+# Keep the profiles dir out of git by default (it contains secrets)
+profiles/
+current-profile.txt
+current-backup/
