@@ -3,12 +3,14 @@ import path from 'path';
 import fs from 'fs-extra';
 import chalk from 'chalk';
 import { spawn, execFileSync } from 'child_process';
+import { encrypt, decrypt } from './secureStore';
 
 export const SWITCH_DIR = path.join(os.homedir(), '.claude-switch');
 export const PROFILES_DIR = path.join(SWITCH_DIR, 'profiles');
 
 /** File used to persist the current account's API key for shell sourcing */
 export const APIKEY_ENV_FILE = path.join(SWITCH_DIR, 'current-apikey.env');
+export const APIKEY_PS_FILE = path.join(SWITCH_DIR, 'current-apikey.ps1');
 
 /** Electron app data dir for Claude (contains IndexedDB / Local Storage) */
 export const APPDATA_CLAUDE_DIR = process.env.APPDATA
@@ -64,6 +66,8 @@ export interface ProfileMetadata {
   accountType?: string;
   /** 'free' | 'pro' | 'max' | 'api' | 'unknown' */
   plan?: string;
+  apiUrl?: string;
+  proxy?: string;
 }
 
 export interface ApiKeyEntry {
@@ -78,7 +82,9 @@ export async function readApiKeyFromProfile(name: string): Promise<string | null
   if (await fs.pathExists(p)) {
     try {
       const entry: ApiKeyEntry = await fs.readJson(p);
-      return entry.key || null;
+      if (!entry.key) return null;
+      // Transparent decryption
+      return decrypt(entry.key);
     } catch {
       return null;
     }
@@ -88,8 +94,10 @@ export async function readApiKeyFromProfile(name: string): Promise<string | null
 
 /** Save an API key into a profile directory */
 export async function saveApiKeyToProfile(name: string, key: string, note?: string): Promise<void> {
+  // Transparent encryption
+  const encryptedKey = encrypt(key);
   const entry: ApiKeyEntry = {
-    key,
+    key: encryptedKey,
     addedAt: new Date().toISOString(),
     ...(note ? { note } : {}),
   };
@@ -207,3 +215,51 @@ export function formatApiKeyExport(key: string): string {
   // bash/zsh
   return `export ANTHROPIC_API_KEY="${key}"`;
 }
+
+/**
+ * Writes both bash/zsh env file and powershell env file containing
+ * environment exports/unsets for the active profile settings.
+ */
+export async function writeShellEnvFiles(
+  apiKey?: string | null,
+  apiUrl?: string | null,
+  proxy?: string | null
+): Promise<void> {
+  let envContent = '';
+  let psContent = '';
+
+  // API Key
+  if (apiKey) {
+    envContent += `export ANTHROPIC_API_KEY="${apiKey}"\n`;
+    psContent += `$env:ANTHROPIC_API_KEY="${apiKey}"\n`;
+  } else {
+    envContent += `unset ANTHROPIC_API_KEY\n`;
+    psContent += `Remove-Item Env:\\ANTHROPIC_API_KEY -ErrorAction SilentlyContinue\n`;
+  }
+
+  // Base URL
+  if (apiUrl) {
+    envContent += `export ANTHROPIC_BASE_URL="${apiUrl}"\n`;
+    psContent += `$env:ANTHROPIC_BASE_URL="${apiUrl}"\n`;
+  } else {
+    envContent += `unset ANTHROPIC_BASE_URL\n`;
+    psContent += `Remove-Item Env:\\ANTHROPIC_BASE_URL -ErrorAction SilentlyContinue\n`;
+  }
+
+  // Proxy settings
+  if (proxy) {
+    envContent += `export HTTPS_PROXY="${proxy}"\n`;
+    envContent += `export HTTP_PROXY="${proxy}"\n`;
+    psContent += `$env:HTTPS_PROXY="${proxy}"\n`;
+    psContent += `$env:HTTP_PROXY="${proxy}"\n`;
+  } else {
+    envContent += `unset HTTPS_PROXY\n`;
+    envContent += `unset HTTP_PROXY\n`;
+    psContent += `Remove-Item Env:\\HTTPS_PROXY -ErrorAction SilentlyContinue\n`;
+    psContent += `Remove-Item Env:\\HTTP_PROXY -ErrorAction SilentlyContinue\n`;
+  }
+
+  await fs.writeFile(APIKEY_ENV_FILE, envContent, 'utf8');
+  await fs.writeFile(APIKEY_PS_FILE, psContent, 'utf8');
+}
+

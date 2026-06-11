@@ -30,6 +30,8 @@ import {
   APIKEY_ENV_FILE,
   formatApiKeyExport,
   resolveClaudeBin,
+  writeShellEnvFiles,
+  APPDATA_CLAUDE_DIR,
 } from './utils';
 import {
   upsertAccount,
@@ -245,6 +247,8 @@ export async function addProfile(
     email?: string;
     plan?: string;
     note?: string;
+    apiUrl?: string;
+    proxy?: string;
   } = {}
 ) {
   const profileDir = getProfileDir(name);
@@ -356,6 +360,8 @@ export async function addProfile(
       ...(options.email ? { email: options.email } : {}),
       ...(options.plan ? { plan: options.plan } : {}),
       ...(options.note ? { note: options.note } : {}),
+      ...(options.apiUrl ? { apiUrl: options.apiUrl } : {}),
+      ...(options.proxy ? { proxy: options.proxy } : {}),
     };
     await fs.writeJson(path.join(profileDir, METADATA_FILE), meta, { spaces: 2 });
 
@@ -367,6 +373,8 @@ export async function addProfile(
       addedAt: new Date().toISOString(),
       ...(options.email ? { email: options.email } : {}),
       ...(options.plan ? { plan: options.plan as PlanType } : {}),
+      ...(options.apiUrl ? { apiUrl: options.apiUrl } : {}),
+      ...(options.proxy ? { proxy: options.proxy } : {}),
     });
 
     spinner.succeed(`Profile "${name}" saved (${mode}).`);
@@ -430,9 +438,9 @@ export async function switchProfile(name: string) {
         process.exit(1);
       }
 
-      // Write .env file for shell sourcing
-      const envLine = formatApiKeyExport(key);
-      await fs.writeFile(APIKEY_ENV_FILE, envLine + '\n', 'utf8');
+      const apiUrl = entry?.apiUrl || meta.apiUrl;
+      const proxy = entry?.proxy || meta.proxy;
+      await writeShellEnvFiles(key, apiUrl, proxy);
 
       spinner.succeed(`Switched to "${name}" (API key mode).`);
       console.log('');
@@ -443,6 +451,9 @@ export async function switchProfile(name: string) {
       logInfo('Or start a new terminal — new sessions will pick it up automatically.');
     } else {
       // ── OAuth credential swap ───────────────────────────────────────────────
+      // Clear env keys so OAuth credentials can take precedence
+      await writeShellEnvFiles(null, null, null);
+
       // 1. Backup current active credentials
       const backupDir = path.join(SWITCH_DIR, 'current-backup');
       await ensureDir(backupDir);
@@ -500,30 +511,39 @@ export async function printEnv(shell?: string) {
     return;
   }
 
-  const key = await readApiKeyFromProfile(current);
-  if (key) {
-    // Delegate shell detection to formatApiKeyExport — single source of truth
-    if (shell === 'powershell') {
-      console.log(`$env:ANTHROPIC_API_KEY="${key}"`);
-    } else if (shell === 'bash') {
-      console.log(`export ANTHROPIC_API_KEY="${key}"`);
-    } else {
-      // Auto-detect based on platform
-      console.log(formatApiKeyExport(key));
-    }
-    return;
-  }
-
-  // OAuth profile — no key to export
   const registry = await loadRegistry();
   const entry = findEntry(registry, current);
-  if (entry?.accountType === 'oauth') {
-    logWarn(`Profile "${current}" uses OAuth (claude auth login) — no API key to export.`);
-    logInfo('OAuth credentials are managed via ~/.claude/.credentials.json automatically.');
+  const meta = await getProfileMetadata(current);
+
+  const key = await readApiKeyFromProfile(current);
+  const apiUrl = entry?.apiUrl || meta?.apiUrl;
+  const proxy = entry?.proxy || meta?.proxy;
+
+  const isPowerShell = shell === 'powershell' || (process.platform === 'win32' && !shell);
+
+  const outputs: string[] = [];
+
+  if (key) {
+    outputs.push(isPowerShell ? `$env:ANTHROPIC_API_KEY="${key}"` : `export ANTHROPIC_API_KEY="${key}"`);
   } else {
-    logWarn(`No API key found for profile "${current}".`);
+    outputs.push(isPowerShell ? `Remove-Item Env:\\ANTHROPIC_API_KEY -ErrorAction SilentlyContinue` : `unset ANTHROPIC_API_KEY`);
   }
-  process.exit(1);
+
+  if (apiUrl) {
+    outputs.push(isPowerShell ? `$env:ANTHROPIC_BASE_URL="${apiUrl}"` : `export ANTHROPIC_BASE_URL="${apiUrl}"`);
+  } else {
+    outputs.push(isPowerShell ? `Remove-Item Env:\\ANTHROPIC_BASE_URL -ErrorAction SilentlyContinue` : `unset ANTHROPIC_BASE_URL`);
+  }
+
+  if (proxy) {
+    outputs.push(isPowerShell ? `$env:HTTPS_PROXY="${proxy}"` : `export HTTPS_PROXY="${proxy}"`);
+    outputs.push(isPowerShell ? `$env:HTTP_PROXY="${proxy}"` : `export HTTP_PROXY="${proxy}"`);
+  } else {
+    outputs.push(isPowerShell ? `Remove-Item Env:\\HTTPS_PROXY -ErrorAction SilentlyContinue` : `unset HTTPS_PROXY`);
+    outputs.push(isPowerShell ? `Remove-Item Env:\\HTTP_PROXY -ErrorAction SilentlyContinue` : `unset HTTP_PROXY`);
+  }
+
+  console.log(outputs.join('\n'));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -961,9 +981,10 @@ export async function resolveProfileQuery(query: string): Promise<string | null>
 // Export / Import
 // ─────────────────────────────────────────────────────────────────────────────
 
-export async function exportProfiles(outputDir: string) {
+export async function exportProfiles(outputDir: string, safe = false) {
   await ensureDir(outputDir);
-  const spinner = ora(`Exporting profiles to ${outputDir}...`).start();
+  const modeLabel = safe ? ' (safe mode)' : '';
+  const spinner = ora(`Exporting profiles to ${outputDir}${modeLabel}...`).start();
 
   try {
     const names = await getAllProfileNames();
@@ -975,7 +996,37 @@ export async function exportProfiles(outputDir: string) {
     for (const name of names) {
       const src = getProfileDir(name);
       const dest = path.join(outputDir, name);
-      await fs.copy(src, dest, { overwrite: true });
+      await ensureDir(dest);
+
+      // Always copy metadata
+      const metaSrc = path.join(src, METADATA_FILE);
+      if (await fs.pathExists(metaSrc)) {
+        await fs.copy(metaSrc, path.join(dest, METADATA_FILE));
+      }
+
+      if (!safe) {
+        // Copy credentials and config in non-safe mode
+        const apikeySrc = path.join(src, APIKEY_FILE);
+        if (await fs.pathExists(apikeySrc)) {
+          await fs.copy(apikeySrc, path.join(dest, APIKEY_FILE));
+        }
+        const oauthSrc = path.join(src, CREDENTIALS_FILE);
+        if (await fs.pathExists(oauthSrc)) {
+          await fs.copy(oauthSrc, path.join(dest, CREDENTIALS_FILE));
+        }
+        const snapSrc = path.join(src, 'credentials.snapshot.json');
+        if (await fs.pathExists(snapSrc)) {
+          await fs.copy(snapSrc, path.join(dest, 'credentials.snapshot.json'));
+        }
+        const fullMarker = path.join(src, 'full.json');
+        if (await fs.pathExists(fullMarker)) {
+          await fs.copy(fullMarker, path.join(dest, 'full.json'));
+        }
+        const configSrc = path.join(src, CONFIG_SUBDIR);
+        if (await fs.pathExists(configSrc)) {
+          await fs.copy(configSrc, path.join(dest, CONFIG_SUBDIR));
+        }
+      }
     }
 
     // Export aliases and registry
@@ -985,8 +1036,12 @@ export async function exportProfiles(outputDir: string) {
     const registry = await loadRegistry();
     await fs.writeJson(path.join(outputDir, 'registry.json'), registry, { spaces: 2 });
 
-    spinner.succeed(`Exported ${names.length} profiles to ${outputDir}`);
-    logInfo('You can zip this folder or move it to another machine.');
+    spinner.succeed(`Exported ${names.length} profiles to ${outputDir}${modeLabel}`);
+    if (safe) {
+      logSuccess('Safe export completed: API keys and credentials were excluded.');
+    } else {
+      logInfo('You can zip this folder or move it to another machine.');
+    }
     logInfo('To import later: claude-switch import ' + outputDir);
   } catch (err: any) {
     spinner.fail('Export failed');
@@ -1064,3 +1119,55 @@ export async function importProfiles(inputDir: string, force = false) {
     logError(err.message);
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Clean temporary files and caches
+// ─────────────────────────────────────────────────────────────────────────────
+export async function cleanProfiles() {
+  const spinner = ora('Cleaning temporary files...').start();
+  try {
+    const backupDir = path.join(SWITCH_DIR, 'current-backup');
+    const psFile = path.join(SWITCH_DIR, 'current-apikey.ps1');
+    const envFile = path.join(SWITCH_DIR, 'current-apikey.env');
+
+    let cleanedCount = 0;
+    if (await fs.pathExists(backupDir)) {
+      await fs.remove(backupDir);
+      cleanedCount++;
+    }
+    if (await fs.pathExists(psFile)) {
+      await fs.remove(psFile);
+      cleanedCount++;
+    }
+    if (await fs.pathExists(envFile)) {
+      await fs.remove(envFile);
+      cleanedCount++;
+    }
+
+    spinner.succeed(`Cleaned ${cleanedCount} temporary files/directories.`);
+
+    const { cleanIndexedDB } = await inquirer.prompt([{
+      type: 'confirm',
+      name: 'cleanIndexedDB',
+      message: 'Do you want to clean Claude Code session databases and history (IndexedDB)?',
+      default: false,
+    }]);
+
+    if (cleanIndexedDB) {
+      const dbDir = path.join(APPDATA_CLAUDE_DIR, 'IndexedDB');
+      if (await fs.pathExists(dbDir)) {
+        const dbSpinner = ora('Clearing Claude IndexedDB...').start();
+        await fs.remove(dbDir).catch((e) => {
+          dbSpinner.warn(`Could not clear IndexedDB fully (it might be in use): ${e.message}`);
+        });
+        dbSpinner.succeed('Claude IndexedDB directories cleared.');
+      } else {
+        logInfo('No Claude IndexedDB directories found.');
+      }
+    }
+  } catch (err: any) {
+    spinner.fail('Cleanup failed');
+    logError(err.message);
+  }
+}
+

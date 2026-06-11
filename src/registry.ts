@@ -32,6 +32,10 @@ export interface AccountEntry {
   lastUsed?: string;
   /** Short note / label */
   note?: string;
+  /** Custom Anthropic API base URL */
+  apiUrl?: string;
+  /** Proxy URL (HTTP/HTTPS) */
+  proxy?: string;
 }
 
 export interface Registry {

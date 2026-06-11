@@ -33,6 +33,7 @@ import {
   importProfiles,
   loginAndCapture,
   printEnv,
+  cleanProfiles,
 } from './profileManager';
 import { ensureClaudeDir, logInfo, logError } from './utils';
 
@@ -93,6 +94,8 @@ program
   .option('--email <email>', 'Set account email (for display in list)')
   .option('--plan <plan>', 'Set plan label: free | pro | max | api', 'unknown')
   .option('--note <note>', 'Attach a short note to the profile')
+  .option('--api-url <url>', 'Set a custom Anthropic API base URL for this profile')
+  .option('--proxy <url>', 'Set a proxy URL (HTTP/HTTPS) for this profile')
   .action(async (name: string, options) => {
     await addProfile(name, {
       force: options.force,
@@ -102,6 +105,8 @@ program
       email: options.email,
       plan: options.plan,
       note: options.note,
+      apiUrl: options.apiUrl,
+      proxy: options.proxy,
     });
   });
 
@@ -222,8 +227,9 @@ program
 program
   .command('export <output-dir>')
   .description('Export all profiles (and aliases/registry) for backup or migration')
-  .action(async (outputDir: string) => {
-    await exportProfiles(outputDir);
+  .option('--safe', 'Exclude sensitive keys and credentials from export')
+  .action(async (outputDir: string, options) => {
+    await exportProfiles(outputDir, options.safe);
   });
 
 program
@@ -232,6 +238,48 @@ program
   .option('-f, --force', 'Overwrite existing profiles with same name')
   .action(async (inputDir: string, options) => {
     await importProfiles(inputDir, options.force);
+  });
+
+program
+  .command('clean')
+  .description('Clean temporary backups and files (optional Claude Code database cleanup)')
+  .action(async () => {
+    await cleanProfiles();
+  });
+
+program
+  .command('init')
+  .description('Print shell wrapper function/hook for automatic environment switching')
+  .action(() => {
+    console.log(chalk.cyan('\n=== Shell Hook Integration ===\n'));
+    console.log('To enable automatic environment switching without needing manual eval,');
+    console.log('add the following wrapper function to your shell profile.\n');
+
+    console.log(chalk.yellow('For Bash / Zsh (add to ~/.bashrc or ~/.zshrc):'));
+    console.log(chalk.gray(`--------------------------------------------------
+csw() {
+  claude-switch "$@"
+  local exit_code=$?
+  if [ -f "$HOME/.claude-switch/current-apikey.env" ]; then
+    source "$HOME/.claude-switch/current-apikey.env"
+  fi
+  return $exit_code
+}
+--------------------------------------------------`));
+
+    console.log(chalk.yellow('\nFor PowerShell (add to $PROFILE or Microsoft.PowerShell_profile.ps1):'));
+    console.log(chalk.gray(`--------------------------------------------------
+function csw {
+    & claude-switch @args
+    $exit_code = $LASTEXITCODE
+    $env_file = "$HOME/.claude-switch/current-apikey.ps1"
+    if (Test-Path $env_file) {
+        . "$env_file"
+    }
+    return $exit_code
+}
+--------------------------------------------------`));
+    console.log('');
   });
 
 program
